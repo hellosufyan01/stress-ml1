@@ -2,16 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-import pickle
-import json
+import pickle, json
 import numpy as np
 import pandas as pd
-import os
 
 app = FastAPI(
     title="StressShield ML API",
-    description="AI stress prediction for CAPF personnel",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -21,20 +18,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Model Load ──────────────────────────────────
-with open('model/model.pkl', 'rb') as f:
+# Load model + config
+with open('model/model.pkl','rb') as f:
     model = pickle.load(f)
-
-with open('model/scaler.pkl', 'rb') as f:
+with open('model/scaler.pkl','rb') as f:
     scaler = pickle.load(f)
+with open('model/config.json','r') as f:
+    config = json.load(f)
 
-with open('model/features.json', 'r') as f:
-    FEATURES = json.load(f)
+FEATURES        = config['features']
+THRESH_HIGH     = config['thresh_high']
+THRESH_CRITICAL = config['thresh_critical']
+RISK_LABELS     = ['LOW','MEDIUM','HIGH','CRITICAL']
 
-RISK_LABELS = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
-print("✅ Model loaded successfully")
+print(f"✅ Model v{config['model_version']} loaded")
+print(f"Sensitivity: {config['sensitivity']*100:.1f}%")
+print(f"ROC AUC: {config['roc_auc']:.4f}")
 
-# ── Request Model ───────────────────────────────
 class PredictRequest(BaseModel):
     personnel_id: str
     deployment_months: float
@@ -49,6 +49,10 @@ class PredictRequest(BaseModel):
     stress_self_rating_avg: float
     days_since_last_assessment: float
     years_of_service: float
+    composite_stress: float = 0.0
+    rest_deficit: float = 0.0
+    leave_pressure: float = 0.0
+    risk_multiplier: float = 1.0
 
 class PredictResponse(BaseModel):
     personnel_id: str
@@ -56,126 +60,149 @@ class PredictResponse(BaseModel):
     risk_level: str
     top_factors: List[str]
     recommendation_hints: List[str]
-    is_fallback: bool = False
+    model_version: str
+    sensitivity: float
 
-# ── Endpoints ───────────────────────────────────
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "model_version": "1.0.0",
-        "features_count": len(FEATURES)
+        "model_version": config['model_version'],
+        "sensitivity": f"{config['sensitivity']*100:.1f}%",
+        "roc_auc": config['roc_auc']
     }
 
 @app.post("/predict", response_model=PredictResponse)
-def predict(request: PredictRequest):
+def predict(req: PredictRequest):
     try:
-        # DataFrame banao — feature names ke saath
+        # Auto compute composite features
+        composite = (
+            req.deployment_months * 0.25 +
+            req.leave_denial_rate_6mo * 25 +
+            (10 - req.mood_score_avg) * 2.5 +
+            max(req.avg_weekly_duty_hours-48, 0) * 0.5
+        )
+        rest_def  = max(req.avg_weekly_duty_hours-48,0)
+        leave_prs = (req.leave_denial_rate_6mo *
+                     req.days_since_last_leave / 30)
+
         df = pd.DataFrame([{
-            'deployment_months':          request.deployment_months,
-            'days_since_last_leave':      request.days_since_last_leave,
-            'leave_denial_rate_6mo':      request.leave_denial_rate_6mo,
-            'avg_weekly_duty_hours':      request.avg_weekly_duty_hours,
-            'night_shift_ratio':          request.night_shift_ratio,
-            'transfer_count_1yr':         request.transfer_count_1yr,
-            'mood_score_avg':             request.mood_score_avg,
-            'sleep_hours_avg':            request.sleep_hours_avg,
-            'workload_rating_avg':        request.workload_rating_avg,
-            'stress_self_rating_avg':     request.stress_self_rating_avg,
-            'days_since_last_assessment': request.days_since_last_assessment,
-            'years_of_service':           request.years_of_service
+            'deployment_months':
+                req.deployment_months,
+            'days_since_last_leave':
+                req.days_since_last_leave,
+            'leave_denial_rate_6mo':
+                req.leave_denial_rate_6mo,
+            'avg_weekly_duty_hours':
+                req.avg_weekly_duty_hours,
+            'night_shift_ratio':
+                req.night_shift_ratio,
+            'transfer_count_1yr':
+                req.transfer_count_1yr,
+            'mood_score_avg':
+                req.mood_score_avg,
+            'sleep_hours_avg':
+                req.sleep_hours_avg,
+            'workload_rating_avg':
+                req.workload_rating_avg,
+            'stress_self_rating_avg':
+                req.stress_self_rating_avg,
+            'days_since_last_assessment':
+                req.days_since_last_assessment,
+            'years_of_service':
+                req.years_of_service,
+            'composite_stress': composite,
+            'rest_deficit':     rest_def,
+            'leave_pressure':   leave_prs,
+            'risk_multiplier':  req.risk_multiplier
         }])[FEATURES]
 
-        # Scale
         scaled = scaler.transform(df)
-        scaled_df = pd.DataFrame(scaled, columns=FEATURES)
-
-        # Predict
+        scaled_df = pd.DataFrame(scaled,
+                                  columns=FEATURES)
         proba = model.predict_proba(scaled_df)[0]
-        risk_class = int(np.argmax(proba))
-        risk_level = RISK_LABELS[risk_class]
 
-        # Score 0-100
+        # Threshold based prediction
+        if proba[3] >= THRESH_CRITICAL:
+            risk_class = 3
+        elif proba[2] >= THRESH_HIGH:
+            risk_class = 2
+        elif proba[1] >= 0.30:
+            risk_class = 1
+        else:
+            risk_class = 0
+
+        risk_level = RISK_LABELS[risk_class]
         score = round(float(
-            proba[0] * 10 +
-            proba[1] * 35 +
-            proba[2] * 70 +
-            proba[3] * 100
+            proba[0]*5 + proba[1]*30 +
+            proba[2]*65 + proba[3]*100
         ), 1)
 
-        # Top factors — simple version (no SHAP)
-        feature_vals = {
-            'deployment_months':          request.deployment_months,
-            'days_since_last_leave':      request.days_since_last_leave,
-            'leave_denial_rate_6mo':      request.leave_denial_rate_6mo,
-            'avg_weekly_duty_hours':      request.avg_weekly_duty_hours,
-            'night_shift_ratio':          request.night_shift_ratio,
-            'transfer_count_1yr':         request.transfer_count_1yr,
-            'mood_score_avg':             request.mood_score_avg,
-            'sleep_hours_avg':            request.sleep_hours_avg,
-            'workload_rating_avg':        request.workload_rating_avg,
-            'stress_self_rating_avg':     request.stress_self_rating_avg,
-            'days_since_last_assessment': request.days_since_last_assessment,
-            'years_of_service':           request.years_of_service
-        }
-
-        # Risk rules — top factors
-        top_factors = []
-        if request.deployment_months > 6:
-            top_factors.append(
-                f"Deployment Duration: {request.deployment_months} months (high risk)"
+        # Top factors
+        factors = []
+        if req.deployment_months > 6:
+            factors.append(
+                f"Deployment: {req.deployment_months}"
+                f" months (threshold: 6)"
             )
-        if request.days_since_last_leave > 90:
-            top_factors.append(
-                f"Days Since Last Leave: {int(request.days_since_last_leave)} days"
+        if req.days_since_last_leave > 90:
+            factors.append(
+                f"No leave since "
+                f"{int(req.days_since_last_leave)} days"
             )
-        if request.leave_denial_rate_6mo > 0.5:
-            top_factors.append(
-                f"Leave Denial Rate: {int(request.leave_denial_rate_6mo*100)}% denials"
+        if req.leave_denial_rate_6mo > 0.5:
+            factors.append(
+                f"Leave denied "
+                f"{int(req.leave_denial_rate_6mo*100)}%"
+                f" of time"
             )
-        if request.avg_weekly_duty_hours > 55:
-            top_factors.append(
-                f"Avg Duty Hours: {request.avg_weekly_duty_hours} hrs/week"
+        if req.avg_weekly_duty_hours > 55:
+            factors.append(
+                f"Duty hours: "
+                f"{req.avg_weekly_duty_hours}"
+                f" hrs/week (norm: 48)"
             )
-        if request.mood_score_avg < 4:
-            top_factors.append(
-                f"Low Mood Score: {request.mood_score_avg}/10"
+        if req.mood_score_avg < 4:
+            factors.append(
+                f"Low mood score: "
+                f"{req.mood_score_avg}/10"
             )
-        if request.sleep_hours_avg < 5:
-            top_factors.append(
-                f"Low Sleep: {request.sleep_hours_avg} hrs/night"
+        if req.sleep_hours_avg < 5:
+            factors.append(
+                f"Poor sleep: "
+                f"{req.sleep_hours_avg} hrs/night"
             )
-
-        if not top_factors:
-            top_factors = ["All indicators within normal range"]
-
-        top_factors = top_factors[:3]
+        if not factors:
+            factors = ["All indicators normal"]
 
         # Recommendations
         hints = []
-        if request.deployment_months > 8:
+        if req.deployment_months > 8:
             hints.append("rotation_priority")
-        if request.days_since_last_leave > 90:
+        if req.days_since_last_leave > 90:
             hints.append("immediate_leave")
-        if request.leave_denial_rate_6mo > 0.5:
-            hints.append("review_leave_applications")
-        if request.mood_score_avg < 4:
-            hints.append("counseling_recommended")
-        if request.avg_weekly_duty_hours > 60:
+        if req.leave_denial_rate_6mo > 0.5:
+            hints.append("review_leave")
+        if req.mood_score_avg < 4:
+            hints.append("counseling")
+        if req.avg_weekly_duty_hours > 60:
             hints.append("workload_reduction")
         if risk_level == "CRITICAL":
-            hints.append("immediate_welfare_intervention")
+            hints.append("immediate_intervention")
         if not hints:
-            hints = ["regular_welfare_checkin"]
+            hints = ["regular_checkin"]
 
         return PredictResponse(
-            personnel_id=request.personnel_id,
+            personnel_id=req.personnel_id,
             score=score,
             risk_level=risk_level,
-            top_factors=top_factors,
+            top_factors=factors[:3],
             recommendation_hints=hints,
-            is_fallback=False
+            model_version=config['model_version'],
+            sensitivity=config['sensitivity']
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500, detail=str(e)
+        )
